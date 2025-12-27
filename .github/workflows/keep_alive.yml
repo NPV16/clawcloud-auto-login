@@ -1,0 +1,37 @@
+name: ClawCloud 自动登录保活 (Node.js)
+
+on:
+  schedule:
+    - cron: '0 7 */3 * *'  # UTC 7:00，每3天运行
+  workflow_dispatch:
+
+jobs:
+  auto-login-js:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: 安装依赖
+        run: |
+          npm install
+          npx playwright install chromium
+          npx playwright install-deps
+
+      - name: 运行自动登录
+        env:
+          GH_USERNAME: ${{ secrets.GH_USERNAME }}
+          GH_PASSWORD: ${{ secrets.GH_PASSWORD }}
+          GH_SESSION: ${{ secrets.GH_SESSION }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          REPO_TOKEN: ${{ secrets.REPO_TOKEN }}
+        run: node scripts/auto_login.js
