@@ -1,6 +1,8 @@
 /**
  * ClawCloud 自动登录 & 余额监控 (Node.js 版)
- * - Исправлен переход: Login -> Launchpad -> Account Center -> Plan
+ * - Умная навигация: ищет кнопку Upgrade вне зависимости от суммы баланса
+ * - Универсальный парсинг: находит остаток по шаблону $X.XX
+ * - Поддержка 2FA через Telegram и обновление сессии GitHub
  */
 
 const fs = require('fs');
@@ -9,6 +11,7 @@ const axios = require('axios');
 const FormData = require('form-data');
 const sodium = require('libsodium-wrappers');
 
+// ==================== Конфигурация ====================
 const CONFIG = {
     CLAW_CLOUD_URL: "https://ap-southeast-1.run.claw.cloud", 
     TWO_FACTOR_WAIT: parseInt(process.env.TWO_FACTOR_WAIT || "120"),
@@ -111,31 +114,45 @@ class AutoLogin {
     }
 
     async getBalance(page) {
-        logger.log("Шаг: Переход в Account Center через App Launchpad...", "STEP");
+        logger.log("Шаг: Поиск кнопки перехода в биллинг...", "STEP");
         try {
-            // 1. Сначала убеждаемся, что мы на главной (App Launchpad)
-            await page.goto(`${CONFIG.CLAW_CLOUD_URL}/`, { waitUntil: 'networkidle' });
-            await sleep(5000);
+            // Ищем кнопку Upgrade по тексту (сумма рядом может меняться, поэтому ищем по 'Upgrade Plan')
+            const upgradeBtn = page.locator('div:has-text("Upgrade Plan")').first();
             
-            // 2. Ищем и кликаем на иконку Account Center (обычно в углу или в списке приложений)
-            // Попробуем перейти по прямой ссылке еще раз, но уже после загрузки главной
-            await page.goto(`${CONFIG.CLAW_CLOUD_URL}/plan`, { waitUntil: 'networkidle', timeout: 30000 });
-            
-            // 3. Ждем появления контента
-            await page.waitForSelector('text=Credits Available', { timeout: 20000 });
+            if (await upgradeBtn.isVisible({ timeout: 15000 })) {
+                await upgradeBtn.click();
+                logger.log("Нажат переход через заголовок (Upgrade Plan)", "SUCCESS");
+            } else {
+                logger.log("Кнопка в хедере не найдена, использую прямой URL", "WARN");
+                await page.goto(`${CONFIG.CLAW_CLOUD_URL}/plan`, { waitUntil: 'networkidle' });
+            }
 
-            const balanceData = await page.evaluate(() => {
-                const elements = Array.from(document.querySelectorAll('div, span, p, h1, h2'));
-                const mainBalance = elements.find(el => /^\$\d+\.\d+$/.test(el.innerText.trim()))?.innerText || "Н/Д";
-                const details = elements.find(el => el.innerText.includes('used'))?.innerText || "";
-                return { mainBalance, details };
+            // Ждем загрузки страницы Account Center
+            await page.waitForSelector('text=Credits Available', { timeout: 20000 });
+            await sleep(3000); // Ожидание подгрузки данных из API ClawCloud
+
+            // Универсальный парсинг через регулярные выражения
+            const data = await page.evaluate(() => {
+                const els = Array.from(document.querySelectorAll('div, span, p, b'));
+                const moneyRegex = /\$\d+\.\d+/; // Ищет формат $4.99, $5.00 и т.д.
+                
+                const balanceEl = els.find(el => moneyRegex.test(el.innerText) && el.children.length === 0);
+                const usedEl = els.find(el => el.innerText.includes('used'));
+                
+                return {
+                    main: balanceEl ? balanceEl.innerText.trim() : "Не найден",
+                    used: usedEl ? usedEl.innerText.trim() : ""
+                };
             });
 
-            return `${balanceData.mainBalance} (${balanceData.details.trim()})`;
+            const info = `${data.main} (${data.used})`;
+            logger.log(`Данные получены: ${info}`, "SUCCESS");
+            return info;
+
         } catch (e) {
-            logger.log(`Ошибка парсинга: ${e.message}`, "WARN");
-            await this.shot(page, "nav_error");
-            return "Ошибка навигации";
+            logger.log(`Ошибка парсинга баланса: ${e.message}`, "WARN");
+            await this.shot(page, "balance_error");
+            return "Ошибка чтения (см. скриншот)";
         }
     }
 
@@ -147,7 +164,7 @@ class AutoLogin {
         await sleep(5000);
 
         if (page.url().includes('two-factor')) {
-            await this.tg.send("🔐 <b>Требуется 2FA</b>\nОтправьте <code>/code XXXXXX</code>");
+            await this.tg.send("🔐 <b>Требуется 2FA</b>\nОтправьте <code>/code XXXXXX</code> в этот чат.");
             const code = await this.tg.waitCode(CONFIG.TWO_FACTOR_WAIT);
             if (code) {
                 await page.fill('input[autocomplete="one-time-code"]', code);
@@ -164,15 +181,16 @@ class AutoLogin {
                   `<b>Статус:</b> ${ok ? "✅ Успех" : "❌ Ошибка"}\n` +
                   `<b>Баланс:</b> <code>${balance}</code>\n` +
                   `<b>Время:</b> ${now}`;
-        if (err) msg += `\n<b>Детали:</b> ${err}`;
+        if (err) msg += `\n<b>Детали:</b> <code>${err}</code>`;
+        
         await this.tg.send(msg);
-        if (this.shots.length > 0) await this.tg.photo(this.shots[this.shots.length - 1], "Состояние страницы");
+        if (this.shots.length > 0) await this.tg.photo(this.shots[this.shots.length - 1], "Скриншот сессии");
     }
 
     async run() {
-        logger.log("Запуск мониторинга...");
+        logger.log("Запуск процесса мониторинга...");
         const browser = await chromium.launch({ headless: true });
-        const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+        const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
 
         if (CONFIG.GH_SESSION) {
             await context.addCookies([{ name: 'user_session', value: CONFIG.GH_SESSION, domain: 'github.com', path: '/' }]);
@@ -187,27 +205,28 @@ class AutoLogin {
                 await page.click('button:has-text("GitHub")');
                 await sleep(5000);
                 if (page.url().includes('github.com/login')) {
-                    await this.loginGithub(page);
+                    if (!await this.loginGithub(page)) throw new Error("Ошибка авторизации GitHub");
                 }
             }
 
             await page.waitForURL(/claw\.cloud/, { timeout: 40000 });
-            
-            // Ждем загрузки Launchpad перед переходом к балансу
-            logger.log("Загрузка App Launchpad...", "STEP");
+            logger.log("Авторизация пройдена, ожидание загрузки интерфейса...", "STEP");
             await sleep(5000); 
 
+            // Парсим баланс
             const balance = await this.getBalance(page);
             
+            // Обновляем сессию в секретах GitHub
             const cookies = await context.cookies();
             const session = cookies.find(c => c.name === 'user_session');
             if (session) await this.secret.update('GH_SESSION', session.value);
 
-            await this.shot(page, "final");
+            await this.shot(page, "success");
             await this.notify(true, balance);
 
         } catch (e) {
             logger.log(e.message, "ERROR");
+            await this.shot(page, "error");
             await this.notify(false, "Ошибка", e.message);
         } finally {
             await browser.close();
