@@ -1,16 +1,18 @@
 /**
  * ClawCloud 自动登录 & 余额监控 (Node.js 版)
- * - Принудительный клик по кнопке "GitHub" на странице входа
- * - Обработка OAuth и 2FA
- * - Универсальный парсинг баланса кредитов
+ * - Принудительный клик по кнопке GitHub при входе
+ * - Переход в Account Center через кнопку Upgrade в хедере
+ * - Универсальный парсинг баланса ($X.XX)
  */
 
 const fs = require('fs');
+const path = require('path');
 const { chromium } = require('playwright');
 const axios = require('axios');
 const FormData = require('form-data');
 const sodium = require('libsodium-wrappers');
 
+// ==================== 配置 ====================
 const CONFIG = {
     CLAW_CLOUD_URL: "https://ap-southeast-1.run.claw.cloud", 
     TWO_FACTOR_WAIT: parseInt(process.env.TWO_FACTOR_WAIT || "120"),
@@ -113,46 +115,49 @@ class AutoLogin {
     }
 
     async getBalance(page) {
-        logger.log("Шаг: Переход на страницу биллинга...", "STEP");
+        logger.log("Шаг: Поиск баланса через раздел Plan...", "STEP");
         try {
-            // Принудительный переход
-            await page.goto(`${CONFIG.CLAW_CLOUD_URL}/plan`, { waitUntil: 'networkidle', timeout: 60000 });
-            
-            // Ждем появления цифр со знаком $
-            await page.waitForSelector('text=$', { timeout: 30000 });
-            await sleep(5000); 
+            // 1. Пытаемся кликнуть на кнопку Upgrade Plan в хедере (где виден баланс на скриншоте)
+            const upgradeBtn = page.locator('div:has-text("Upgrade Plan")').first();
+            if (await upgradeBtn.isVisible({ timeout: 10000 })) {
+                await upgradeBtn.click();
+            } else {
+                // Если кнопки нет, идем по прямой ссылке
+                await page.goto(`${CONFIG.CLAW_CLOUD_URL}/plan`, { waitUntil: 'networkidle' });
+            }
 
+            // 2. Ждем загрузки страницы биллинга
+            await page.waitForSelector('text=Credits Available', { timeout: 20000 });
+            await sleep(3000);
+
+            // 3. Парсим данные баланса
             const data = await page.evaluate(() => {
                 const els = Array.from(document.querySelectorAll('div, span, p, b'));
                 const moneyRegex = /\$\d+\.\d+/;
-                // Ищем элемент с суммой (короткий текст с $)
                 const balanceEl = els.find(el => moneyRegex.test(el.innerText) && el.innerText.length < 15);
-                // Ищем инфо об использовании (слово used)
                 const usedEl = els.find(el => el.innerText.toLowerCase().includes('used'));
                 return {
                     main: balanceEl ? balanceEl.innerText.trim() : "Н/Д",
                     used: usedEl ? usedEl.innerText.trim() : ""
                 };
             });
-            return `${data.main} ${data.used ? '(' + data.used + ')' : ''}`;
+
+            const result = `${data.main} ${data.used ? '(' + data.used + ')' : ''}`;
+            logger.log(`Баланс найден: ${result}`, "SUCCESS");
+            return result;
         } catch (e) {
-            logger.log(`Ошибка парсинга: ${e.message}`, "WARN");
-            await this.shot(page, "error_on_plan_page");
-            return "Ошибка (см. скриншот)";
+            logger.log(`Не удалось найти баланс: ${e.message}`, "WARN");
+            return "Н/Д (ошибка парсинга)";
         }
     }
 
-    async handleGithubSteps(page) {
-        // 1. Если попали на страницу логина GitHub
-        if (page.url().includes('github.com/login')) {
-            logger.log("Ввод учетных данных GitHub...", "STEP");
-            await page.fill('input[name="login"]', CONFIG.GH_USERNAME);
-            await page.fill('input[name="password"]', CONFIG.GH_PASSWORD);
-            await page.click('input[type="submit"]');
-            await sleep(5000);
-        }
+    async loginGithub(page) {
+        logger.log("Вход в GitHub...", "STEP");
+        await page.fill('input[name="login"]', CONFIG.GH_USERNAME);
+        await page.fill('input[name="password"]', CONFIG.GH_PASSWORD);
+        await page.click('input[type="submit"]');
+        await sleep(5000);
 
-        // 2. Если требуется 2FA
         if (page.url().includes('two-factor')) {
             await this.tg.send("🔐 <b>Нужен 2FA код</b>\nОтправьте <code>/code XXXXXX</code>");
             const code = await this.tg.waitCode(CONFIG.TWO_FACTOR_WAIT);
@@ -162,14 +167,14 @@ class AutoLogin {
                 await sleep(5000);
             }
         }
-
-        // 3. Если требуется подтверждение OAuth (кнопка Authorize)
+        
+        // Обработка кнопки Authorize
         const authBtn = page.locator('button[name="authorize"]');
         if (await authBtn.isVisible({ timeout: 5000 })) {
-            logger.log("Нажимаю Authorize GitHub...", "STEP");
             await authBtn.click();
             await sleep(5000);
         }
+        return true;
     }
 
     async notify(ok, balance = "", err = "") {
@@ -177,11 +182,11 @@ class AutoLogin {
         let msg = `<b>🤖 ClawCloud Monitor</b>\n\n<b>Статус:</b> ${ok ? "✅ Успех" : "❌ Ошибка"}\n<b>Баланс:</b> <code>${balance}</code>\n<b>Время:</b> ${now}`;
         if (err) msg += `\n<b>Детали:</b> <code>${err}</code>`;
         await this.tg.send(msg);
-        if (this.shots.length > 0) await this.tg.photo(this.shots[this.shots.length - 1], "Скриншот экрана");
+        if (this.shots.length > 0) await this.tg.photo(this.shots[this.shots.length - 1], "Скриншот сессии");
     }
 
     async run() {
-        logger.log("Запуск скрипта...");
+        logger.log("Запуск процесса...");
         const browser = await chromium.launch({ headless: true });
         const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
 
@@ -192,41 +197,38 @@ class AutoLogin {
         const page = await context.newPage();
 
         try {
-            // Переходим на страницу логина ClawCloud
             await page.goto(CONFIG.SIGNIN_URL, { waitUntil: 'networkidle' });
-            await sleep(3000);
-
-            // Кликаем по кнопке GitHub (ищем по тексту или иконке)
-            const githubLoginBtn = page.locator('button:has-text("GitHub"), .ant-btn-github');
-            if (await githubLoginBtn.isVisible()) {
-                logger.log("Нажимаю кнопку логина через GitHub...", "STEP");
-                await githubLoginBtn.click();
-                await sleep(5000);
+            
+            // Если мы на странице логина, жмем GitHub
+            if (page.url().includes('signin')) {
+                const ghBtn = page.locator('button:has-text("GitHub"), .ant-btn-github');
+                if (await ghBtn.isVisible()) {
+                    await ghBtn.click();
+                    await sleep(5000);
+                    if (page.url().includes('github.com/login')) {
+                        await this.loginGithub(page);
+                    }
+                }
             }
 
-            // Обрабатываем все шаги GitHub (логин, 2FA, OAuth)
-            await this.handleGithubSteps(page);
-
-            // Ожидаем возврата в ClawCloud
             await page.waitForURL(/claw\.cloud/, { timeout: 60000 });
-            logger.log("Вход выполнен успешно", "SUCCESS");
+            logger.log("Авторизация успешна", "SUCCESS");
             await sleep(8000); 
 
-            // Сбор данных о балансе
+            // Сбор баланса
             const balance = await this.getBalance(page);
             
-            // Обновление GH_SESSION
+            // Обновление сессии
             const cookies = await context.cookies();
             const session = cookies.find(c => c.name === 'user_session');
             if (session) await this.secret.update('GH_SESSION', session.value);
 
-            await this.shot(page, "final_state");
+            await this.shot(page, "final");
             await this.notify(true, balance);
 
         } catch (e) {
             logger.log(e.message, "ERROR");
-            await this.shot(page, "error_state");
-            await this.notify(false, "Ошибка", e.message);
+            await this.notify(false, "Н/Д", e.message);
         } finally {
             await browser.close();
         }
