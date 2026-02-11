@@ -1,8 +1,6 @@
 /**
  * ClawCloud 自动登录 & 余额监控 (Node.js 版)
- * - Принудительный клик по кнопке "GitHub" для входа
- * - Обработка логина, 2FA и страницы Authorize
- * - Переход в раздел Upgrade Plan для чтения баланса
+ * Регион: EU Central 1 (Frankfurt)
  */
 
 const fs = require('fs');
@@ -11,8 +9,10 @@ const axios = require('axios');
 const FormData = require('form-data');
 const sodium = require('libsodium-wrappers');
 
+// ==================== КОНФИГУРАЦИЯ ====================
 const CONFIG = {
-    CLAW_CLOUD_URL: "https://ap-southeast-1.run.claw.cloud", 
+    // Измененный URL для европейского региона
+    CLAW_CLOUD_URL: "https://eu-central-1.run.claw.cloud", 
     TWO_FACTOR_WAIT: parseInt(process.env.TWO_FACTOR_WAIT || "120"),
     GH_USERNAME: process.env.GH_USERNAME,
     GH_PASSWORD: process.env.GH_PASSWORD,
@@ -35,7 +35,6 @@ class Logger {
         console.log(line);
         this.logs.push(line);
     }
-    getRecentLogs() { return this.logs.slice(-6).join("\n"); }
 }
 const logger = new Logger();
 
@@ -80,28 +79,9 @@ class Telegram {
     }
 }
 
-class SecretUpdater {
-    async update(name, value) {
-        if (!CONFIG.REPO_TOKEN || !CONFIG.GITHUB_REPOSITORY) return false;
-        try {
-            await sodium.ready;
-            const headers = { "Authorization": `token ${CONFIG.REPO_TOKEN}`, "Accept": "application/vnd.github.v3+json" };
-            const { data: keyData } = await axios.get(`https://api.github.com/repos/${CONFIG.GITHUB_REPOSITORY}/actions/secrets/public-key`, { headers });
-            const binkey = sodium.from_base64(keyData.key, sodium.base64_variants.ORIGINAL);
-            const encBytes = sodium.crypto_box_seal(sodium.from_string(value), binkey);
-            await axios.put(`https://api.github.com/repos/${CONFIG.GITHUB_REPOSITORY}/actions/secrets/${name}`, {
-                encrypted_value: sodium.to_base64(encBytes, sodium.base64_variants.ORIGINAL),
-                key_id: keyData.key_id
-            }, { headers });
-            return true;
-        } catch (e) { return false; }
-    }
-}
-
 class AutoLogin {
     constructor() {
         this.tg = new Telegram();
-        this.secret = new SecretUpdater();
         this.shots = [];
     }
 
@@ -113,10 +93,11 @@ class AutoLogin {
     }
 
     async getBalance(page) {
-        logger.log("Шаг: Переход в Account Center через Upgrade Plan...", "STEP");
+        logger.log("Переход в раздел биллинга...", "STEP");
         try {
-            const upgradeBtn = page.locator('div:has-text("Upgrade Plan")').first();
-            if (await upgradeBtn.isVisible({ timeout: 15000 })) {
+            // Ищем кнопку с балансом в шапке или принудительно идем в /plan
+            const upgradeBtn = page.locator('div:has-text("Upgrade Plan"), .ant-tag-blue').first();
+            if (await upgradeBtn.isVisible({ timeout: 10000 })) {
                 await upgradeBtn.click();
             } else {
                 await page.goto(`${CONFIG.CLAW_CLOUD_URL}/plan`, { waitUntil: 'networkidle' });
@@ -125,24 +106,19 @@ class AutoLogin {
             await page.waitForSelector('text=Credits Available', { timeout: 20000 });
             await sleep(3000);
 
-            const data = await page.evaluate(() => {
-                const els = Array.from(document.querySelectorAll('div, span, p, b'));
+            return await page.evaluate(() => {
+                const els = Array.from(document.querySelectorAll('div, span, b'));
                 const moneyRegex = /\$\d+\.\d+/;
-                const balanceEl = els.find(el => moneyRegex.test(el.innerText) && el.innerText.length < 15);
+                const balanceEl = els.find(el => moneyRegex.test(el.innerText) && el.innerText.length < 12);
                 const usedEl = els.find(el => el.innerText.toLowerCase().includes('used'));
-                return {
-                    main: balanceEl ? balanceEl.innerText.trim() : "Н/Д",
-                    used: usedEl ? usedEl.innerText.trim() : ""
-                };
+                return `${balanceEl ? balanceEl.innerText.trim() : "Н/Д"} ${usedEl ? '(' + usedEl.innerText.trim() + ')' : ''}`;
             });
-            return `${data.main} ${data.used ? '(' + data.used + ')' : ''}`;
         } catch (e) {
-            return "Н/Д (ошибка парсинга)";
+            return "Ошибка парсинга баланса";
         }
     }
 
     async handleGithub(page) {
-        // Логин
         if (page.url().includes('github.com/login')) {
             logger.log("Ввод данных GitHub...", "STEP");
             await page.fill('input[name="login"]', CONFIG.GH_USERNAME);
@@ -150,9 +126,8 @@ class AutoLogin {
             await page.click('input[type="submit"]');
             await sleep(5000);
         }
-        // 2FA
         if (page.url().includes('two-factor')) {
-            await this.tg.send("🔐 <b>Нужен 2FA код</b>\nОтправьте <code>/code XXXXXX</code>");
+            await this.tg.send("🔐 <b>Нужен 2FA код для EU региона</b>");
             const code = await this.tg.waitCode(CONFIG.TWO_FACTOR_WAIT);
             if (code) {
                 await page.fill('input[autocomplete="one-time-code"]', code);
@@ -160,17 +135,15 @@ class AutoLogin {
                 await sleep(5000);
             }
         }
-        // OAuth Authorize
         const authBtn = page.locator('button[name="authorize"]');
         if (await authBtn.isVisible({ timeout: 5000 })) {
-            logger.log("Нажимаю Authorize GitHub...", "STEP");
             await authBtn.click();
             await sleep(5000);
         }
     }
 
     async run() {
-        logger.log("Запуск скрипта...");
+        logger.log(`Запуск мониторинга для региона EU...`);
         const browser = await chromium.launch({ headless: true });
         const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
 
@@ -183,43 +156,28 @@ class AutoLogin {
         try {
             await page.goto(CONFIG.SIGNIN_URL, { waitUntil: 'networkidle' });
             
-            // ГЛАВНОЕ: Ищем и нажимаем кнопку GitHub на странице входа
-            const githubBtn = page.locator('button:has-text("GitHub"), .ant-btn-github').first();
-            if (await githubBtn.isVisible({ timeout: 10000 })) {
-                logger.log("Найдена кнопка GitHub, выполняю вход...", "STEP");
+            // Нажимаем GitHub на странице входа
+            const githubBtn = page.locator('button:has-text("GitHub"), [class*="github"]').first();
+            if (await githubBtn.isVisible()) {
                 await githubBtn.click();
                 await sleep(5000);
                 await this.handleGithub(page);
             }
 
             await page.waitForURL(/claw\.cloud/, { timeout: 60000 });
-            logger.log("Вход в систему выполнен", "SUCCESS");
             await sleep(8000); 
 
             const balance = await this.getBalance(page);
             
-            // Обновление сессии
-            const cookies = await context.cookies();
-            const session = cookies.find(c => c.name === 'user_session');
-            if (session) await this.secret.update('GH_SESSION', session.value);
-
-            await this.shot(page, "final");
-            await this.notify(true, balance);
+            await this.shot(page, "eu_final");
+            await this.tg.send(`<b>🤖 ClawCloud EU</b>\nСтатус: ✅ Успех\nБаланс: <code>${balance}</code>`);
 
         } catch (e) {
             logger.log(e.message, "ERROR");
-            await this.notify(false, "Н/Д", e.message);
+            await this.tg.send(`<b>🤖 ClawCloud EU</b>\n❌ Ошибка: ${e.message}`);
         } finally {
             await browser.close();
         }
-    }
-
-    async notify(ok, balance = "", err = "") {
-        const now = new Date().toLocaleString('ru-RU', { timeZone: 'Asia/Shanghai' });
-        let msg = `<b>🤖 ClawCloud Monitor</b>\n\n<b>Статус:</b> ${ok ? "✅ Успех" : "❌ Ошибка"}\n<b>Баланс:</b> <code>${balance}</code>\n<b>Время:</b> ${now}`;
-        if (err) msg += `\n<b>Детали:</b> <code>${err}</code>`;
-        await this.tg.send(msg);
-        if (this.shots.length > 0) await this.tg.photo(this.shots[this.shots.length - 1], "Экран");
     }
 }
 
